@@ -1,5 +1,7 @@
 # Titan Network — Hướng dẫn chạy `titan.sh`
 
+### Link: https://test4.titannet.io/Invitelogin?code=2zNL3u
+
 README này hướng dẫn cách **tải, cấp quyền và chạy** script `titan.sh` từ repo:
 `https://github.com/nongdancryptos/Titan-Network` (file `titan.sh`).
 
