@@ -1,222 +1,215 @@
 #!/usr/bin/env bash
-# Titan multi-node launcher with Docker + screen (one screen per node)
-# - Creates N containers: titan_1 ... titan_N
-# - Each has its own data dir: ~/.titanedge-<i> and storage ~/titan_storage_<i>
-# - Assigns unique ports: START_PORT, START_PORT+1, ...
-# - Binds all nodes with the SAME HASH (your choice; may violate platform policy)
-# - Spawns screen sessions: titan-1 ... titan-N, each tailing the node's logs
+# Titan Agent multi-node (native) per project guide — WITH UNIQUE PORTS
+# - Reads KEY from ./key.txt
+# - Asks how many nodes to run
+# - Creates /opt/titanagent-1..N
+# - Sets unique ListenAddress ports (START_PORT, START_PORT+1, ...)
+# - Spawns N screen sessions: titan-1..titan-N
+# - Installs Snap+Multipass per guide (skip with --no-multipass)
 
 set -euo pipefail
 
-IMAGE="nezha123/titan-edge"
-BIND_URL="https://api-test1.container1.titannet.io/api/v2/device/binding"
+AGENT_ZIP_URL="https://pcdn.titannet.io/test4/bin/agent-linux.zip"
+SERVER_URL="https://test4-api.titannet.io"
+BASE_DIR="/opt"
+WORKDIR_PREFIX="${BASE_DIR}/titanagent"
+TMP_ZIP="/tmp/agent-linux.zip"
 
-# Defaults (you can override by exporting env vars before running)
-HASH="${HASH:-}"
-NODES="${NODES:-}"
-START_PORT="${START_PORT:-1234}"
-STORAGE_GB="${STORAGE_GB:-50}"
-SLEEP_AFTER_RUN="${SLEEP_AFTER_RUN:-10}"   # seconds to wait after first start
-RECREATE="${RECREATE:-false}"               # "true" to recreate containers if exist
+# Config
+START_PORT="${START_PORT:-1234}"   # cổng đầu tiên cho node #1
+STORAGE_GB="${STORAGE_GB:-50}"     # (tùy chọn) nếu agent đọc từ config.toml
 
 # Colors
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
+G='\033[1;32m'; B='\033[1;34m'; Y='\033[1;33m'; R='\033[1;31m'; N='\033[0m'
+info(){ echo -e "${B}[INFO]${N} $*"; }
+ok(){   echo -e "${G}[ OK ]${N} $*"; }
+warn(){ echo -e "${Y}[WARN]${N} $*"; }
+err(){  echo -e "${R}[ERR ]${N} $*" >&2; }
 
-need_root_pkgs() {
-  if command -v apt-get &>/dev/null; then
-    sudo apt-get update -y
-    sudo apt-get install -y curl wget jq lsof unzip ca-certificates screen docker.io
-    sudo systemctl enable --now docker || true
-  elif command -v dnf &>/dev/null; then
-    sudo dnf install -y curl wget jq lsof unzip ca-certificates screen docker
-    sudo systemctl enable --now docker || true
-  elif command -v yum &>/dev/null; then
-    sudo yum install -y curl wget jq lsof unzip ca-certificates screen docker
-    sudo systemctl enable --now docker || true
+require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || { err "Please run as root (sudo)."; exit 1; }; }
+
+detect_pmgr(){
+  if command -v apt >/dev/null 2>&1; then echo apt
+  elif command -v dnf >/dev/null 2>&1; then echo dnf
+  elif command -v yum >/dev/null 2>&1; then echo yum
+  else err "Unsupported distro (need apt/dnf/yum)."; exit 1; fi
+}
+
+ensure_prereqs(){
+  local pmgr; pmgr=$(detect_pmgr)
+  info "Installing prerequisites (wget unzip ca-certificates screen lsof)..."
+  case "$pmgr" in
+    apt)
+      apt update -y
+      DEBIAN_FRONTEND=noninteractive apt install -y wget unzip ca-certificates screen lsof
+      update-ca-certificates || true
+      ;;
+    dnf)
+      dnf install -y wget unzip ca-certificates screen lsof || true
+      update-ca-trust || true
+      ;;
+    yum)
+      yum install -y wget unzip ca-certificates screen lsof || true
+      update-ca-trust || true
+      ;;
+  esac
+  ok "Prerequisites ready."
+}
+
+ensure_snap_multipass(){
+  if ! command -v snap >/dev/null 2>&1; then
+    info "snap not found → installing snapd (per guide)..."
+    local pmgr; pmgr=$(detect_pmgr)
+    case "$pmgr" in
+      apt) apt update -y; apt install -y snapd ;;
+      dnf) dnf install -y snapd ;;
+      yum) yum install -y snapd ;;
+    esac
+    ok "snapd installed."
   else
-    echo -e "${RED}Không xác định được distro (cần apt/dnf/yum).${NC}"
+    ok "snap is present."
+  fi
+  info "Enabling snapd.socket..."
+  systemctl enable --now snapd.socket || true
+  ok "snapd.socket enabled."
+
+  if ! command -v multipass >/dev/null 2>&1; then
+    info "Installing Multipass via snap (per guide)..."
+    snap install multipass
+    ok "Multipass installed."
+  else
+    ok "Multipass is already installed."
+  fi
+
+  info "Multipass version:"
+  multipass --version || warn "Could not run 'multipass --version'; continuing."
+}
+
+read_key_from_file(){
+  local key_file="./key.txt"
+  if [[ ! -f "$key_file" ]]; then
+    err "Missing key.txt next to the script. Create it with your KEY (single line)."
     exit 1
   fi
-}
-
-check_deps() {
-  echo -e "${BLUE}Kiểm tra & cài đặt phụ thuộc...${NC}"
-  need_root_pkgs
-
-  if ! command -v docker &>/dev/null; then
-    echo -e "${RED}Docker chưa cài đặt được. Thoát.${NC}"; exit 1
-  fi
-  if ! command -v screen &>/dev/null; then
-    echo -e "${RED}screen chưa cài đặt được. Thoát.${NC}"; exit 1
-  fi
-
-  echo -e "${BLUE}Kéo image Docker: ${IMAGE}...${NC}"
-  sudo docker pull "${IMAGE}"
-  echo -e "${GREEN}OK.${NC}"
-}
-
-ask_if_empty() {
-  local varname="$1" prompt="$2"
-  local v="${!varname:-}"
-  if [[ -z "$v" ]]; then
-    read -r -p "$prompt" v
-    if [[ -z "$v" ]]; then
-      echo -e "${RED}Thiếu thông tin bắt buộc. Thoát.${NC}"
-      exit 1
-    fi
-    eval "$varname=\"\$v\""
-  fi
-}
-
-assert_int() {
-  local name="$1" val="$2"
-  if ! [[ "$val" =~ ^[0-9]+$ ]]; then
-    echo -e "${RED}${name} phải là số nguyên.${NC}"
+  TITAN_KEY="$(grep -m1 -E '.+' "$key_file" | tr -d '[:space:]' || true)"
+  if [[ -z "${TITAN_KEY:-}" ]]; then
+    err "key.txt is empty. Put your KEY in it."
     exit 1
   fi
+  ok "Loaded KEY from key.txt"
 }
 
-free_port_or_exit() {
+assert_int(){ [[ "$2" =~ ^[0-9]+$ ]] || { err "$1 phải là số nguyên."; exit 1; }; }
+
+ask_nodes(){
+  local n="${NODES:-}"
+  if [[ -z "$n" ]]; then
+    read -r -p "Bạn muốn tạo bao nhiêu node? (ví dụ 5): " n
+  fi
+  assert_int "Số node" "$n"
+  [[ "$n" -ge 1 ]] || { err "Số node phải ≥ 1."; exit 1; }
+  NODES="$n"
+  assert_int "START_PORT" "$START_PORT"
+  ok "Will create $NODES node(s), starting port at $START_PORT."
+}
+
+free_port_or_exit(){
   local port="$1"
   if lsof -i :"$port" -sTCP:LISTEN &>/dev/null; then
-    echo -e "${RED}Cổng $port đang bị chiếm. Hãy đổi START_PORT hoặc tắt dịch vụ đang dùng cổng này.${NC}"
+    err "Cổng $port đang bị chiếm. Đổi START_PORT hoặc giải phóng cổng."
     exit 1
   fi
 }
 
-stop_rm_if_exists() {
-  local name="$1"
-  if sudo docker ps -a --format '{{.Names}}' | grep -wq "$name"; then
-    if [[ "$RECREATE" == "true" ]]; then
-      echo -e "${YELLOW}Container $name đã tồn tại → dừng & xóa để tạo lại.${NC}"
-      sudo docker stop "$name" || true
-      sudo docker rm "$name" || true
-    else
-      echo -e "${YELLOW}Container $name đã tồn tại. Bỏ qua tạo mới (RECREATE=false).${NC}"
-      return 1
-    fi
+download_agent_once(){
+  info "Downloading agent package..."
+  rm -f "$TMP_ZIP"
+  if ! wget -q -O "$TMP_ZIP" "$AGENT_ZIP_URL"; then
+    err "Failed to download agent zip. Check network and retry."
+    exit 1
   fi
-  return 0
+  ok "Downloaded to $TMP_ZIP"
 }
 
-ensure_config_port_and_storage() {
-  local name="$1" port="$2" storage_gb="$3"
+prepare_node_dir(){
+  local idx="$1"
+  local dir="${WORKDIR_PREFIX}-${idx}"
+  mkdir -p "$dir"
+  unzip -o "$TMP_ZIP" -d "$dir" >/dev/null
+  chmod +x "$dir/agent" || true
+  echo "$dir"
+}
 
-  # Thử chờ file config xuất hiện
-  local retries=15
-  local ok=0
-  while (( retries > 0 )); do
-    if sudo docker exec "$name" bash -lc 'test -f $HOME/.titanedge/config.toml' ; then
-      ok=1; break
-    fi
-    sleep 2; ((retries--))
-  done
-
-  if [[ "$ok" -ne 1 ]]; then
-    echo -e "${YELLOW}Chưa thấy config.toml; vẫn tiếp tục chỉnh bằng sed (có thể lần đầu agent sẽ tự tạo sau).${NC}"
+write_port_config(){
+  # Tạo/ghi config.toml trong WORKDIR để set ListenAddress và (tuỳ chọn) StorageGB
+  local dir="$1" port="$2"
+  local cfg="${dir}/config.toml"
+  touch "$cfg"
+  # Ghi/replace ListenAddress
+  if grep -q '^[[:space:]]*ListenAddress' "$cfg"; then
+    sed -i "s#^[[:space:]]*ListenAddress.*#ListenAddress = \"0.0.0.0:${port}\"#g" "$cfg"
+  else
+    echo "ListenAddress = \"0.0.0.0:${port}\"" >> "$cfg"
   fi
-
-  # Chỉnh StorageGB & ListenAddress
-  sudo docker exec "$name" bash -lc "\
-    CFG=\$HOME/.titanedge/config.toml; \
-    mkdir -p \$HOME/.titanedge/storage; \
-    touch \$CFG; \
-    if grep -q '^[[:space:]]*StorageGB' \$CFG; then \
-      sed -i 's/^[[:space:]]*StorageGB.*/StorageGB = ${storage_gb}/' \$CFG; \
-    else \
-      echo 'StorageGB = ${storage_gb}' >> \$CFG; \
-    fi; \
-    if grep -q '^[[:space:]]*ListenAddress' \$CFG; then \
-      sed -i 's#^[[:space:]]*ListenAddress.*#ListenAddress = \"0.0.0.0:${port}\"#' \$CFG; \
-    else \
-      echo 'ListenAddress = \"0.0.0.0:${port}\"' >> \$CFG; \
-    fi; \
-    echo OK"
-
-  sudo docker restart "$name" >/dev/null
+  # (tuỳ chọn) ghi StorageGB nếu muốn giữ cấu hình tập trung
+  if ! grep -q '^[[:space:]]*StorageGB' "$cfg"; then
+    echo "StorageGB = ${STORAGE_GB}" >> "$cfg"
+  fi
+  ok "Port set: ${cfg} ⇒ 0.0.0.0:${port}"
 }
 
-bind_node() {
-  local name="$1" hash="$2"
-  echo -e "${BLUE}Bind node $name ...${NC}"
-  # Một số image có binary tên titan-edge; tên entrypoint là "titan-edge" trong PATH
-  sudo docker exec "$name" bash -lc "titan-edge bind --hash=${hash} ${BIND_URL}" || {
-    echo -e "${YELLOW}Bind cách 1 thất bại, thử qua wrapper 'titan-edge' nếu khác PATH...${NC}"
-    sudo docker exec "$name" bash -lc "/usr/local/bin/titan-edge bind --hash=${hash} ${BIND_URL}" || true
-  }
-}
-
-create_screen_tail() {
-  local name="$1" screen_name="$2"
-  # Nếu screen tồn tại, bỏ qua
-  if screen -ls | grep -wq "$screen_name"; then
-    echo -e "${YELLOW}Screen ${screen_name} đã tồn tại. Bỏ qua tạo mới.${NC}"
+start_node_in_screen(){
+  local idx="$1" dir="$2"
+  local sname="titan-${idx}"
+  if screen -ls | grep -wq "$sname"; then
+    warn "Screen ${sname} đã tồn tại → bỏ qua start trùng."
     return 0
   fi
-  # Tạo screen chạy docker logs -f cho container
-  screen -S "$screen_name" -dm bash -lc "echo -e '${CYAN}Attaching logs for ${name}...${NC}'; sudo docker logs -f $name"
+  info "Starting node #$idx in screen '${sname}'..."
+  # Chạy agent; agent sẽ đọc config.toml trong WORKDIR
+  screen -S "$sname" -dm bash -lc "cd '$dir'; ./agent --working-dir='$dir' --server-url='${SERVER_URL}' --key='${TITAN_KEY}' 2>&1 | tee -a agent.log"
+  ok "Node #$idx started. Attach: screen -r ${sname}"
 }
 
-main() {
-  echo -e "${CYAN}=== Titan multi-node with Docker + screen ===${NC}"
-  check_deps
+main(){
+  require_root
 
-  ask_if_empty HASH         "Nhập HASH/KEY của bạn: "
-  ask_if_empty NODES        "Muốn tạo bao nhiêu node? (ví dụ 5): "
-  assert_int "NODES" "$NODES"
-  assert_int "START_PORT" "$START_PORT"
-  assert_int "STORAGE_GB" "$STORAGE_GB"
+  # flags
+  local DO_MULTIPASS="true"
+  while (( "$#" )); do
+    case "$1" in
+      --no-multipass) DO_MULTIPASS="false" ;;
+      *) err "Unknown option: $1"; exit 1 ;;
+    esac
+    shift
+  done
 
-  # Kiểm tra tranh chấp cổng trước
+  ensure_prereqs
+  [[ "$DO_MULTIPASS" == "true" ]] && ensure_snap_multipass || warn "Skipping Multipass install (--no-multipass)."
+
+  read_key_from_file
+  ask_nodes
+  download_agent_once
+
+  # check trước các cổng
   for ((i=0; i<NODES; i++)); do
     free_port_or_exit "$((START_PORT+i))"
   done
 
-  # Dừng & xóa các container cũ thuộc image này nếu RECREATE=true-all
-  echo -e "${BLUE}Chuẩn bị tạo ${NODES} node...${NC}"
-
   for ((i=1; i<=NODES; i++)); do
-    name="titan_${i}"
-    data_dir="$HOME/.titanedge-${i}"
-    storage_dir="$HOME/titan_storage_${i}"
-    port="$((START_PORT + i - 1))"
-    screen_name="titan-${i}"
-
-    echo -e "${BLUE}# Node ${i}: container=${name}, port=${port}, data=${data_dir}${NC}"
-
-    mkdir -p "$data_dir" "$storage_dir"
-    chmod 700 "$data_dir"
-    chmod 777 "$storage_dir" || true
-
-    if stop_rm_if_exists "$name"; then
-      # Tạo container mới chạy nền (host network để tối ưu)
-      sudo docker run -d \
-        --restart always \
-        --name "$name" \
-        --net=host \
-        -v "${data_dir}:/root/.titanedge" \
-        -v "${storage_dir}:/root/.titanedge/storage" \
-        "${IMAGE}" >/dev/null
-
-      echo -e "${GREEN}Container ${name} đã tạo.${NC}"
-      sleep "$SLEEP_AFTER_RUN"
-
-      ensure_config_port_and_storage "$name" "$port" "$STORAGE_GB"
-      bind_node "$name" "$HASH"
-    else
-      echo -e "${YELLOW}Bỏ qua tạo mới ${name}.${NC}"
-    fi
-
-    create_screen_tail "$name" "$screen_name"
-    echo -e "${GREEN}Screen ${screen_name} đang theo dõi logs của ${name}.${NC}\n"
+    local_port="$((START_PORT + i - 1))"
+    node_dir="$(prepare_node_dir "$i")"
+    write_port_config "$node_dir" "$local_port"
+    start_node_in_screen "$i" "$node_dir"
   done
 
-  echo -e "${CYAN}Hoàn tất!${NC}"
-  echo -e "Attach xem log một node bất kỳ: ${YELLOW}screen -r titan-1${NC} (hoặc titan-2, titan-3, ...)"
-  echo -e "Thoát screen nhưng để chạy nền: nhấn ${YELLOW}Ctrl+A rồi D${NC}"
-  echo -e "Xem nhanh trạng thái containers: ${YELLOW}sudo docker ps --format 'table {{.Names}}\t{{.Status}}'${NC}"
-  echo -e "Gỡ tất cả (thận trọng): đặt ${YELLOW}RECREATE=true${NC} và xóa containers theo tên titan_* nếu cần."
-  echo -e "\n${YELLOW}Note:${NC} Dùng cùng một HASH cho nhiều node có thể vi phạm chính sách nền tảng."
+  echo
+  echo -e "${G}All done!${N} Screens created:"
+  screen -ls || true
+  echo -e "Attach a node log: ${Y}screen -r titan-1${N} (hoặc titan-2, titan-3, ...)"
+  echo -e "Detach (keep running): ${Y}Ctrl+A rồi D${N}"
+  echo -e "Workdirs: ${Y}${WORKDIR_PREFIX}-1 .. ${WORKDIR_PREFIX}-${NODES}${N}"
+  echo -e "Logs: ${Y}/opt/titanagent-<i>/agent.log${N}"
 }
 
 main "$@"
