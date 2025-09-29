@@ -1,29 +1,28 @@
-# Titan Multi-Screen (Auto-Port)
+# Titan Network — Hướng dẫn chạy `titan.sh` (ngắn gọn)
 
-Chạy **N Titan Agents** (native, không Docker) — mỗi node 1 thư mục, 1 cổng riêng, 1 screen riêng.
+Script gốc: `titan.sh` từ repo **nongdancryptos/Titan-Network**. Dùng để cài và chạy Titan Agent theo hướng dẫn của dự án.
 
-## Chuẩn bị
+## Yêu cầu
 - Linux (Ubuntu/Debian/Fedora/CentOS/RHEL), quyền `sudo`.
-- Tạo **key.txt** (cùng thư mục script) chứa **KEY** 1 dòng:
-  ```bash
-  echo "YOUR-TITAN-KEY" > key.txt
-  ```
+- Kết nối Internet ổn định.
 
-## Cách chạy
+## Cách chạy nhanh (không cần clone)
 ```bash
-chmod +x titan-multiscreen-autopor t.sh
-sudo ./titan-multiscreen-autopor t.sh        # hỏi số node, tự tìm cổng trống
-# Bỏ qua cài Multipass (nếu muốn):
-sudo ./titan-multiscreen-autopor t.sh --no-multipass
+curl -fsSL https://raw.githubusercontent.com/nongdancryptos/Titan-Network/main/titan.sh -o titan.sh
+chmod +x titan.sh
+sudo ./titan.sh
+```
+> Script sẽ hiện menu (cài đặt/chạy node, gỡ cài đặt, v.v.). Làm theo hướng dẫn trên màn hình.
+
+## Cách chạy khi clone repo
+```bash
+git clone https://github.com/nongdancryptos/Titan-Network.git
+cd Titan-Network
+chmod +x titan.sh
+sudo ./titan.sh
 ```
 
-## Theo dõi & quản lý
-- Liệt kê screen: `screen -ls`
-- Vào log node #1: `screen -r titan-1`  (thoát: **Ctrl+A**, rồi **D**)
-- Log file: `/opt/titanagent-<i>/agent.log`
-- Thư mục node: `/opt/titanagent-1 .. /opt/titanagent-N`
-
 ## Ghi chú
-- Script chạy đúng lệnh dự án:  
-  `./agent --working-dir=<dir> --server-url=https://test4-api.titannet.io --key=<KEY>`
-- Nhiều node cùng **1 KEY**: kỹ thuật chạy được nhưng có thể **không hợp lệ theo chính sách**. Cân nhắc rủi ro.
+- Khi được yêu cầu, chuẩn bị **KEY**/mã đăng ký của tài khoản Titan để bind node.
+- Nếu script hỏi cài **Snap/Multipass** hoặc các gói phụ thuộc, hãy đồng ý để đi đúng hướng dẫn của dự án.
+- Muốn dừng/gỡ node: chạy lại `./titan.sh` và chọn mục **Uninstall/Remove** (nếu menu có).
